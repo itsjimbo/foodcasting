@@ -1,0 +1,9 @@
+.DS_Store
+cache
+__pycache__
+sql-lite-cache
+.ipynb_checkpoints
+data
+report_files
+.ipynb
+.Rhistory

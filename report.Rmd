@@ -1,0 +1,469 @@
+---
+title: 'CS410 Group Project - foodcasting R code'
+author: "Fall 2019, by James Banasiak (jamesmb3) Mark Hornback (markh4) "
+date: 'Due: Sunday, Dec 15 by 11:59 PM Pacific Time'
+geometry: margin=.1in
+fontsize: 11pt
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+    df_print: kable
+    pandoc_args: [
+      "-V", "classoption=twocolumn"
+    ]
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '2'
+header-includes:
+  - \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+  - \usepackage[fontsize=10pt]{scrextend}
+---
+
+
+```{r setup, include=FALSE}
+  knitr::opts_chunk$set(include = TRUE)  # TRUE for solution; FALSE for questions set
+
+  knitr::opts_chunk$set(echo = TRUE)
+  knitr::opts_chunk$set(message = FALSE)
+  knitr::opts_chunk$set(warning = FALSE)
+  knitr::opts_chunk$set(fig.height = 6, fig.width = 8, out.width = '50%', fig.align = "center")
+  options(width = 90)
+```
+
+```{css, echo=FALSE}
+.solution {
+background-color: #e6ffe6;
+}
+```
+
+
+```{r echo=F}
+# a better preinstaller - you may need to run to complile from source
+########################################################################
+# OSX Notes
+########################################################################
+# osx install xcode and run
+#     xcode-select --install
+#     brew cask install gfortran
+#
+REQUIRED_LIBS<-c('knitr','kableExtra','rpart','tidyverse','tidytext','widyr','glmnet','doMC','ggplot2','stringr','dplyr','wordcloud','e1071','tm','caret','quanteda','tidytext','widyr','doParallel','text2vec','RSQLite','dplyr')
+
+# automatically install any missing packages - set
+if (length(setdiff(REQUIRED_LIBS, rownames(installed.packages()))) > 0) {
+  install.packages(setdiff(REQUIRED_LIBS, rownames(installed.packages())),repos = "http://cran.us.r-project.org")
+}
+# require the libraries mentioned in REQUIRED_LIBS, hiding the non warning output
+invisible(lapply(REQUIRED_LIBS,require,character.only=TRUE))
+```
+
+
+# Project Description
+
+We set off on a journey to predict ratings of restaurants from menu item data.
+
+# Gathering the corpus
+
+The description of the elements contained within the data set is:
+
+
+For the business listings -
+- `slug` - a unique portion of the url, typically dashed business name for http://{host}.com/path/{slug}
+- `categories` -  the type of foods the restaurant serves, eg Pizza, Chinese, Mexican
+- `distance`- the distance from the centroid of the zip code
+- `name` - the name of the restaurant
+- `price_level` - a yelp categorical price level \$= under \$10. \$\$=11-30. \$\$\$=31-60. \$\$\$\$= over 61 USD
+- `rating`- **predictor**   the yelp rating associated with a restaurnat
+- `review_count`- the number of reviews that were taken to establish the rating
+- `url` - the url from yelp
+- `lat` -the latitude of the location of the restaurant
+- `lng` - the longitude of the location of the restaurant
+- `Sp1` - a spacer (not used)
+- `type` - the type - all `natural` words
+- `homeurl` - the path portion of the url
+- `resource_id1` - a resource id used in yelp specific api
+- `resource_id2` - a resource id used in yelp specific api
+- `lat2` - the latitude again resulting from a join within scraper
+- `lng2` -  the longitude again resulting from a join within scraper
+
+For the menuitems-
+- `slug` -  a unique portion of the url, typically dashed business name for http://{host}.com/path/{slug}
+- `title` - a menuitem title eg `Chicken Caesar Salad`
+- `description` -  the longer description of the title eg `Grilled chicken, romaine, Parmesan, tomatoes and Caesar dressing`
+- `price` -  the price of the menuitem eg `7.99`
+
+
+# Data processing
+
+```{r}
+# set cpu cores
+CPU_CORES <- parallel::detectCores()
+
+# setwd("~/git/foodcasting")
+conn <- dbConnect(RSQLite::SQLite(), "sql-lite-cache/foodcasting.db")
+# get main corpus
+df_summary <- dbGetQuery(conn,"SELECT * from summary t1 WHERE t1.slug is not null and t1.slug<>'slug'")
+df_menu <- dbGetQuery(conn,"SELECT * from menu t1 WHERE t1.slug is not null and t1.slug<>'slug'")
+df <- dbGetQuery(conn,"SELECT t1.slug,t1.categories,t1.rating,t1.review_count,t1.lat,t1.lng,t2.title,t2.description,t2.price from summary t1 left join menu t2 on (t1.slug=t2.slug) WHERE t1.slug is not null and t1.slug<>'slug'")
+
+# remove null  price  and over 5K menuitems
+df <- df %>% filter(!is.na(price))  %>% filter(price <= 5000)  %>% filter(!is.na(rating))
+# show structure
+str(df)
+# price prob best in log scale
+par(mfrow=c(1,2), mar = rep(4, 4))
+hist(log(df$price),main="Histogram of log(price)")
+hist(log(df$rating),main="Histogram of log(rating)")
+# consolidate chr ? too many
+
+
+```
+
+```{r}
+# plot basic price vs rating to establish a correlation
+ggplot(df, aes(price, rating)) +
+  geom_point(alpha = .1) +
+  geom_smooth(method = "lm") +
+  scale_x_log10()
+
+x<-log(df$price)
+x[which(!is.finite(x))]<-NA
+
+# show simple model, there is something here worth exploring
+model1 <- lm(x ~ review_count + rating + lat + lng, data = df)
+summary(model1)
+
+```
+
+There does appear to be signficance of pr
+
+```{r}
+
+# start by expanding words remove stop words
+df_title <- df %>%
+  mutate(id = row_number()) %>%
+  unnest_tokens(word, title) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!word %in% c("ls"),
+         str_detect(word, "[a-z]"))
+# lets look at top 30 words inside title
+
+```
+```{r}
+
+df_title %>%
+  count(word, sort = TRUE) %>%
+  head(20) %>%
+  mutate(word = fct_reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  coord_flip()
+```
+
+```{r}
+
+df_desc <- df %>%
+  mutate(id = row_number()) %>%
+  unnest_tokens(word, description) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!word %in% c("ls"),
+         str_detect(word, "[a-z]"))
+# lets look at top 30 words inside desc
+```
+```{r}
+df_desc %>%
+  count(word, sort = TRUE) %>%
+  head(20) %>%
+  mutate(word = fct_reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col() +
+  coord_flip()
+
+```
+
+
+
+```{r}
+df_title_agg <- df_title %>%
+  distinct(id, word) %>%
+  add_count(word) %>%
+  filter(n >= 100)
+
+df_desc_agg <- df_desc %>%
+  distinct(id, word) %>%
+  add_count(word) %>%
+  filter(n >= 100)
+
+
+```
+
+```{r}
+# correlation of pairs of items
+# df_title_agg %>%
+#   pairwise_cor(word, id, sort = TRUE)
+#
+#
+# df_desc_agg %>%
+#   pairwise_cor(word, id, sort = TRUE)
+
+# create a sparse matrix from row names, column names, and values in a table
+m_title <- df_title_agg %>% cast_sparse(id, word)
+m_desc <- df_desc_agg %>% cast_sparse(id, word)
+# save ids and ratings
+ids_titles <- as.integer(rownames(m_title))
+ratings_titles <- df$rating[ids_titles]
+
+ids_desc <- as.integer(rownames(m_desc))
+ratings_desc <- df$rating[ids_desc]
+# create new df with
+df_word_matrix_title <-cbind(m_title, log_ratings = df$rating[ids_titles])
+df_word_matrix_desc <-cbind(m_desc, log_ratings = df$rating[ids_desc])
+# run glm on our data
+
+library(doParallel)
+cl <- makePSOCKcluster(CPU_CORES)
+registerDoParallel(cl)
+#cv_model <- cv.glmnet(m, df$price[ids_titles], parallel = TRUE)
+cv_model_title <- cv.glmnet(m_title, ratings_titles, parallel = TRUE)
+cv_model_desc <- cv.glmnet(m_desc, ratings_desc, parallel = TRUE)
+stopCluster(cl)
+
+```
+
+```{r}
+
+plot(cv_model_title)
+plot(cv_model_desc)
+# change 1se to red dashed
+abline(v=log(cv_model$lambda.1se),col='red', lt=20)
+#  build lexicons for sentiment - use the lambda obtained and get values of the  estimates for each word
+lexicon_title <- cv_model_title$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == cv_model_title$lambda.1se,
+         term != "(Intercept)",
+         term != "log_ratings") %>%
+  dplyr::select(word = term, coefficient = estimate)
+
+lexicon_desc<- cv_model_desc$glmnet.fit %>%
+  tidy() %>%
+  filter(lambda == cv_model_desc$lambda.1se,
+         term != "(Intercept)",
+         term != "log_ratings") %>%
+  dplyr::select(word = term, coefficient = estimate)
+
+
+posnegwords_title <- lexicon_title %>%
+    arrange(coefficient) %>%
+    group_by(posneg = ifelse(coefficient < 0, "Negative", "Positive")) %>%
+    top_n(30, abs(coefficient)) %>%
+    ungroup()
+
+posnegwords_desc <- lexicon_desc %>%
+    arrange(coefficient) %>%
+    group_by(posneg = ifelse(coefficient < 0, "Negative", "Positive")) %>%
+    top_n(30, abs(coefficient)) %>%
+    ungroup()
+
+
+posnegwords_title%>%
+    mutate(word = fct_reorder(word, coefficient)) %>%
+    ggplot(aes(word, coefficient, fill = posneg)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = "",
+         y = "Effect of word",
+         title = "menuitem title +/- effect of words")
+
+
+posnegwords_desc%>%
+    mutate(word = fct_reorder(word, coefficient)) %>%
+    ggplot(aes(word, coefficient, fill = posneg)) +
+    geom_col() +
+    coord_flip() +
+    labs(x = "",
+         y = "Effect of word",
+         title = "menuitem description +/- effect of words")
+
+
+
+# # visualize  positive wordcloud
+# par(mfrow = c(1, 2))
+# df4[df4$coefficient>0,] %>%
+#   count(word) %>%
+#   with(wordcloud(word, n, max.words = 100, colors = 'green'))
+#
+# #isualize  negative wordcloud
+# df4[df4$coefficient<0,] %>%
+#   count(word) %>%
+#   with(wordcloud(word, n, max.words = 100, colors = 'red'))
+
+
+```
+
+```{r}
+#df_title_merged<-left_join(df_title_agg,lexicon_title,by='word')
+#df_desc_merged<-left_join(df_desc_agg,lexicon_desc,by='word')
+# remove stopwords associated with wine that have little meaning
+# paste0(sort(x),collapse = "','")
+local_stopwords = c('–','and')
+stopworddf<- data.frame(local_stopwords,"Custom")
+colnames(stopworddf) = c("word","lexicon")
+# add SMART lexicon
+allstopwords <- rbind(stop_words,stopworddf)
+
+# tokenized.df <- df %>%
+#   dplyr::select( categories, title, description, price) %>%
+#   unnest_tokens(word, description) %>%
+#   anti_join(allstopwords) %>%
+#   filter(!str_detect(word, "[0-9]"))
+
+
+dfbigram_title <- df %>%
+  dplyr::select(categories, title, description, price) %>%
+  unnest_tokens(bigram, title, token = "ngrams", n = 2) %>% #bigram
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% allstopwords$word,
+         !word2 %in% allstopwords$word,
+         !str_detect(word1, "[0-9]"),
+         !str_detect(word2, "[0-9]")) %>%
+  unite(bigram, word1, word2, sep = " ")
+
+
+dfbigram_desc <- df %>%
+  dplyr::select(categories, title, description, price) %>%
+  unnest_tokens(bigram, description, token = "ngrams", n = 2) %>% #bigram
+  separate(bigram, c("word1", "word2"), sep = " ") %>%
+  filter(!word1 %in% allstopwords$word,
+         !word2 %in% allstopwords$word,
+         !str_detect(word1, "[0-9]"),
+         !str_detect(word2, "[0-9]")) %>%
+  unite(bigram, word1, word2, sep = " ")
+
+
+dfbigram_title %>%
+  count(bigram) %>%
+  top_n(50,n) %>%
+  arrange(desc(n)) %>%
+  ggplot(aes(x = reorder(bigram, n), y = n)) +
+  geom_bar(stat = "identity", color = "navyblue", fill = "royalblue") +
+  theme(legend.position = "none") +
+  coord_flip() +
+  labs(y = "Frequency",
+       x = "Top bigrams",
+       title = "Top bigrams used",
+       subtitle = "")
+
+
+
+
+
+dfbigram_desc %>%
+  count(bigram) %>%
+  top_n(50,n) %>%
+  arrange(desc(n)) %>%
+  ggplot(aes(x = reorder(bigram, n), y = n)) +
+  geom_bar(stat = "identity", color = "navyblue", fill = "royalblue") +
+  theme(legend.position = "none") +
+  coord_flip() +
+  labs(y = "Frequency",
+       x = "Top bigrams",
+       title = "Top bigrams used",
+       subtitle = "")
+
+
+
+
+
+```
+
+```{r}
+# dfbigram %>%
+#   filter(region %in% unname(unlist(top5_variety_region))) %>%
+#   group_by(region, bigram) %>%
+#   tally() %>%
+#   top_n(10,n) %>%
+#   arrange(desc(n)) %>%
+#   ggplot(aes(x = reorder(bigram, n), y = n, fill = factor(region))) +
+#   geom_bar(stat = "identity") +
+#   theme(legend.position = "none") +
+#   facet_wrap(~ region, scales = "free") +
+#   coord_flip() +
+#   labs(y = "Frequency",
+#        x = "bigrams",
+#        title = "bigrams used by top5 region",
+#        subtitle = "")
+
+
+
+# test/train split
+dfnew2 <- df %>%  na.omit()  %>% sample_n(19000)
+train_indexes <- createDataPartition(dfnew2$rating, times = 1, p = 0.7, list = FALSE)
+train <- dfnew2[train_indexes,]
+test  <- dfnew2[-train_indexes,]
+
+train.tokens <- tokens(train$description, what = "word",
+                       remove_numbers = TRUE, remove_punct = TRUE,
+                       remove_symbols = TRUE, remove_hyphens = TRUE)
+train.tokens <- tokens_tolower(train.tokens)
+train.tokens <- tokens_select(train.tokens, allstopwords,
+                              selection = "remove")
+train.tokens <- tokens_wordstem(train.tokens, language = "english")
+train.tokens.dfm <- dfm(train.tokens, tolower = FALSE)
+train.tokens.dfm <- dfm_trim(train.tokens.dfm, sparsity = 0.99)
+train.tokens.matrix <- as.matrix(train.tokens.dfm)
+train.tokens.df <- cbind(Label = train$rating, convert(train.tokens.dfm, to = 'data.frame'))
+
+
+# maybe use bm25
+tf.idf <- function(x, idf) {
+  x * idf
+}
+# term freq
+termfreq <- apply(train.tokens.matrix, 1,  function(x) {
+  x / sum(x)
+})
+# idf
+idf <- apply(train.tokens.matrix, 2, function(x){
+  corpus.size <- length(x)
+  c <- length(which(x > 0))
+  log(corpus.size / c)
+})
+# calculate tfidf
+tfidf <- apply(termfreq, 2, tf.idf, idf = idf)
+tfidf <- t(tfidf)
+incomplete.cases <- which(!complete.cases(tfidf))
+tfidf[incomplete.cases,] <- rep(0.0, ncol(tfidf))
+
+# add features back
+tfidf <- cbind(Label = train$rating, data.frame(tfidf), train$price)
+
+# train model with linear SVM ane 10-fold Cross Validation
+# may take forever to perform cross validation
+library(doParallel)
+cl <- makePSOCKcluster(CPU_CORES)
+registerDoParallel(cl)
+all_svm_token_models <- train(Label~., data = tfidf, method = 'svmLinear3', trControl = trainControl(method = "cv", number = 10, allowParallel=TRUE),parallel = TRUE)
+plot(all_svm_token_models)
+all_svm_token_models$finalModel
+stopCluster(cl)
+
+# todo: apply weighted cv_model lexicon sentitment ratings to tfidf to get the full effect
+
+```
+
+
+# Predictions/Recommendations
+
+We can utilize a postive/negative word approach using `glmnet.fit` and create a ratings the words that are utilzized in descriptive text, for example in a unigram setting we see that `Mcdonalds menu items` actually has a negative coefficient to it.
+
+```{r}
+negative_words<-lexicon %>% arrange(coefficient)
+positive_words<-lexicon %>% arrange(desc(coefficient))
+
+positive_words[1:10,] %>%  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+
+negative_words[1:10,] %>%  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = F)
+```
